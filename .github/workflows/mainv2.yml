@@ -1,0 +1,784 @@
+name: Eden Android - Pause + L Toggle + Right Touch Camera
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: "Product flavor ('genshinSpoof' = the 'Eden Optimized' build)"
+        required: true
+        default: "genshinSpoof"
+        type: choice
+        options:
+          - genshinSpoof
+          - mainline
+          - legacy
+
+      nightly:
+        description: 'Build as Nightly (app name gets " Nightly" suffix)'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  EDEN_REPO: https://github.com/eden-emulator/mirror.git
+  EDEN_COMMIT: 37fe9119526c03ca064166130cc983c55b9a9e86
+
+jobs:
+  build-eden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+
+      # ============================================================
+      # FREE DISK SPACE
+      # ============================================================
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet \
+            /usr/local/share/powershell \
+            /opt/ghc \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" || true
+
+          df -h /
+
+      # ============================================================
+      # CLONE EDEN
+      # ============================================================
+
+      - name: Clone Eden at pinned commit
+        run: |
+          git clone "$EDEN_REPO" eden
+
+          cd eden
+
+          git checkout "$EDEN_COMMIT"
+
+          git submodule update --init --recursive
+
+          git rev-parse HEAD
+
+      # ============================================================
+      # PATCH EDEN
+      # ============================================================
+
+      - name: Patch Eden - Pause + L Toggle + Right Touch Camera
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import sys
+          import re
+
+          root = pathlib.Path("eden")
+
+          activity_file = root / \
+              "src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt"
+
+          button_file = root / \
+              "src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlayDrawableButton.kt"
+
+          overlay_file = root / \
+              "src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlay.kt"
+
+          activity_src = activity_file.read_text()
+          button_src = button_file.read_text()
+          overlay_src = overlay_file.read_text()
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+
+              if count != 1:
+                  sys.exit(
+                      f"PATCH FAILED - anchor not unique/found "
+                      f"({count}x): {label}"
+                  )
+
+              return text.replace(old, new, 1)
+
+          # ==========================================================
+          # PART 1
+          # FLOATING PAUSE / RESUME BUTTON
+          # ==========================================================
+
+          activity_src = replace_once(
+              activity_src,
+              "setContentView(binding.root)",
+              "setContentView(binding.root)\n"
+              "        setupPauseResumeButton()",
+              "insert pause button setup",
+          )
+
+          pause_helpers = """
+              private var fabPauseResume:
+                  com.google.android.material.floatingactionbutton.FloatingActionButton? = null
+
+              private fun setupPauseResumeButton() {
+                  val fab =
+                      com.google.android.material.floatingactionbutton.FloatingActionButton(this)
+
+                  fabPauseResume = fab
+
+                  val density = resources.displayMetrics.density
+
+                  val layoutParams =
+                      android.widget.FrameLayout.LayoutParams(
+                          android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                          android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          gravity =
+                              android.view.Gravity.TOP or
+                              android.view.Gravity.END
+
+                          topMargin = (80 * density).toInt()
+                          rightMargin = (16 * density).toInt()
+                      }
+
+                  fab.layoutParams = layoutParams
+
+                  fab.size =
+                      com.google.android.material.floatingactionbutton.FloatingActionButton.SIZE_MINI
+
+                  fab.setImageResource(
+                      android.R.drawable.ic_media_pause
+                  )
+
+                  fab.visibility = android.view.View.GONE
+
+                  fab.setOnClickListener {
+                      if (!NativeLibrary.isRunning()) {
+                          return@setOnClickListener
+                      }
+
+                      if (NativeLibrary.isPaused()) {
+                          NativeLibrary.unpauseEmulation()
+                      } else {
+                          NativeLibrary.pauseEmulation()
+                      }
+
+                      updatePauseResumeButtonIcon()
+                  }
+
+                  val root =
+                      findViewById<android.view.ViewGroup>(android.R.id.content)
+
+                  root.addView(fab)
+              }
+
+              private fun updatePauseResumeButtonIcon() {
+                  fabPauseResume?.setImageResource(
+                      if (NativeLibrary.isPaused()) {
+                          android.R.drawable.ic_media_play
+                      } else {
+                          android.R.drawable.ic_media_pause
+                      }
+                  )
+              }
+
+          """
+
+          activity_src = replace_once(
+              activity_src,
+              "    private fun enableFullscreenImmersive() {",
+              pause_helpers +
+              "    private fun enableFullscreenImmersive() {",
+              "insert pause helper functions",
+          )
+
+          activity_src = replace_once(
+              activity_src,
+              "        nfcReader.startScanning()",
+              "        nfcReader.startScanning()\n"
+              "        updatePauseResumeButtonIcon()",
+              "update pause icon on resume",
+          )
+
+          activity_src = replace_once(
+              activity_src,
+              "        NativeLibrary.playTimeManagerStart()",
+              "        NativeLibrary.playTimeManagerStart()\n"
+              "\n"
+              "        fabPauseResume?.visibility = android.view.View.VISIBLE\n"
+              "        updatePauseResumeButtonIcon()",
+              "show pause button when emulation starts",
+          )
+
+          activity_src = replace_once(
+              activity_src,
+              "        emulationViewModel.setEmulationStopped(true)",
+              "        emulationViewModel.setEmulationStopped(true)\n"
+              "        fabPauseResume?.visibility = android.view.View.GONE",
+              "hide pause button when emulation stops",
+          )
+
+          # Prevent FAB touches from reaching game touch handling.
+          activity_src = replace_once(
+              activity_src,
+              "    override fun dispatchTouchEvent(event: MotionEvent): Boolean {",
+              """    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+                  fabPauseResume?.let { fab ->
+                      if (fab.visibility == android.view.View.VISIBLE) {
+                          val rect = android.graphics.Rect()
+
+                          fab.getGlobalVisibleRect(rect)
+
+                          if (rect.contains(
+                                  event.x.toInt(),
+                                  event.y.toInt()
+                              )
+                          ) {
+                              return super.dispatchTouchEvent(event)
+                          }
+                      }
+                  }
+              """,
+              "protect pause FAB touch",
+          )
+
+          activity_file.write_text(activity_src)
+
+          # ==========================================================
+          # PART 2
+          # L BUTTON = TOGGLE
+          # ==========================================================
+
+          # The old workflow depended on exact whitespace.
+          # This version finds the same logic regardless of spacing.
+          l_pattern = re.compile(
+              r"""
+              if\s*\(\s*isActionDown\s*\)\s*\{
+                  \s*
+                  if\s*\(\s*!\s*bounds\.contains\(\s*xPosition\s*,\s*yPosition\s*\)\s*\)\s*\{
+                      \s*return\s+false\s*
+                  \}
+                  \s*
+                  pressedState\s*=\s*true
+                  \s*
+                  trackId\s*=\s*pointerId
+                  \s*
+                  return\s+true
+                  \s*
+              \}
+              \s*
+              if\s*\(\s*isActionUp\s*\)\s*\{
+                  \s*
+                  if\s*\(\s*trackId\s*!=\s*pointerId\s*\)\s*\{
+                      \s*return\s+false\s*
+                  \}
+                  \s*
+                  pressedState\s*=\s*false
+                  \s*
+                  trackId\s*=\s*-1
+                  \s*
+                  return\s+true
+                  \s*
+              \}
+              \s*
+              return\s+false
+              """,
+              re.VERBOSE,
+          )
+
+          l_matches = list(l_pattern.finditer(button_src))
+
+          if len(l_matches) != 1:
+              sys.exit(
+                  "PATCH FAILED - L touch logic not found uniquely "
+                  f"({len(l_matches)} matches)"
+              )
+
+          new_l_logic = """        if (isActionDown) {
+              if (!bounds.contains(xPosition, yPosition)) {
+                  return false
+              }
+
+              if (button == NativeButton.L) {
+                  // L is a toggle.
+                  // First tap = ON.
+                  // Second tap = OFF.
+                  // Releasing the finger does NOT turn it off.
+                  pressedState = !pressedState
+                  trackId = -1
+                  return true
+              }
+
+              pressedState = true
+              trackId = pointerId
+              return true
+          }
+
+          if (isActionUp) {
+              if (trackId != pointerId) {
+                  return false
+              }
+
+              pressedState = false
+              trackId = -1
+              return true
+          }
+
+          return false"""
+
+          button_src = (
+              button_src[:l_matches[0].start()]
+              + new_l_logic
+              + button_src[l_matches[0].end():]
+          )
+
+          button_file.write_text(button_src)
+
+          # ==========================================================
+          # PART 3
+          # RIGHT TOUCH CAMERA
+          #
+          # Active area:
+          #   right 45% of screen
+          #   bottom 55% of screen
+          #
+          # Result:
+          #   bottom-right rectangle
+          # ==========================================================
+
+          camera_fields = """
+              // ======================================================
+              // Right Touch Camera
+              // ======================================================
+
+              private var cameraPointerId = -1
+              private var cameraLastX = 0f
+              private var cameraLastY = 0f
+              private var cameraLastTime = 0L
+
+              private val cameraSensitivity = 1.0f
+
+              // Finger speed required for maximum stick output.
+              private val cameraReferenceSpeed = 900f
+
+          """
+
+          overlay_src = replace_once(
+              overlay_src,
+              "    private lateinit var windowInsets: WindowInsets",
+              camera_fields +
+              "    private lateinit var windowInsets: WindowInsets",
+              "insert camera fields",
+          )
+
+          camera_helpers = """
+              private fun isRightTouchCameraArea(
+                  x: Float,
+                  y: Float
+              ): Boolean {
+                  return x >= width * 0.55f &&
+                      y >= height * 0.45f &&
+                      y <= height.toFloat()
+              }
+
+              private fun getCameraPlayerIndex(): Int {
+                  return when (NativeInput.getStyleIndex(0)) {
+                      NpadStyleIndex.Handheld -> 8
+                      else -> 0
+                  }
+              }
+
+              private fun updateRightTouchCamera(
+                  event: MotionEvent
+              ): Boolean {
+
+                  val action = event.actionMasked
+
+                  // ==================================================
+                  // DOWN
+                  // ==================================================
+
+                  if (
+                      action == MotionEvent.ACTION_DOWN ||
+                      action == MotionEvent.ACTION_POINTER_DOWN
+                  ) {
+
+                      val pointerIndex = event.actionIndex
+                      val pointerId = event.getPointerId(pointerIndex)
+
+                      val x = event.getX(pointerIndex)
+                      val y = event.getY(pointerIndex)
+
+                      if (
+                          cameraPointerId == -1 &&
+                          isRightTouchCameraArea(x, y) &&
+                          !isTouchInputConsumed(pointerId)
+                      ) {
+
+                          cameraPointerId = pointerId
+
+                          cameraLastX = x
+                          cameraLastY = y
+                          cameraLastTime = event.eventTime
+
+                          NativeInput.onOverlayJoystickEvent(
+                              getCameraPlayerIndex(),
+                              NativeAnalog.RStick,
+                              0f,
+                              0f
+                          )
+
+                          return true
+                      }
+                  }
+
+                  // ==================================================
+                  // MOVE
+                  // ==================================================
+
+                  if (
+                      action == MotionEvent.ACTION_MOVE &&
+                      cameraPointerId != -1
+                  ) {
+
+                      var pointerIndex = -1
+
+                      for (i in 0 until event.pointerCount) {
+                          if (
+                              event.getPointerId(i) ==
+                              cameraPointerId
+                          ) {
+                              pointerIndex = i
+                              break
+                          }
+                      }
+
+                      if (pointerIndex >= 0) {
+
+                          val x = event.getX(pointerIndex)
+                          val y = event.getY(pointerIndex)
+
+                          val deltaTimeMs =
+                              (
+                                  event.eventTime -
+                                  cameraLastTime
+                              ).coerceAtLeast(1L)
+
+                          val deltaTimeSeconds =
+                              deltaTimeMs / 1000f
+
+                          val velocityX =
+                              (x - cameraLastX) /
+                              deltaTimeSeconds
+
+                          val velocityY =
+                              (y - cameraLastY) /
+                              deltaTimeSeconds
+
+                          var cameraX =
+                              (
+                                  velocityX /
+                                  cameraReferenceSpeed
+                              ) * cameraSensitivity
+
+                          var cameraY =
+                              (
+                                  -velocityY /
+                                  cameraReferenceSpeed
+                              ) * cameraSensitivity
+
+                          cameraX =
+                              cameraX.coerceIn(-1f, 1f)
+
+                          cameraY =
+                              cameraY.coerceIn(-1f, 1f)
+
+                          NativeInput.onOverlayJoystickEvent(
+                              getCameraPlayerIndex(),
+                              NativeAnalog.RStick,
+                              cameraX,
+                              cameraY
+                          )
+
+                          cameraLastX = x
+                          cameraLastY = y
+                          cameraLastTime = event.eventTime
+
+                          return true
+                      }
+                  }
+
+                  // ==================================================
+                  // UP / CANCEL
+                  // ==================================================
+
+                  if (
+                      action == MotionEvent.ACTION_UP ||
+                      action == MotionEvent.ACTION_POINTER_UP ||
+                      action == MotionEvent.ACTION_CANCEL
+                  ) {
+
+                      val pointerIndex =
+                          if (
+                              action ==
+                              MotionEvent.ACTION_POINTER_UP
+                          ) {
+                              event.actionIndex
+                          } else {
+                              0
+                          }
+
+                      if (event.pointerCount > pointerIndex) {
+
+                          val pointerId =
+                              event.getPointerId(pointerIndex)
+
+                          if (pointerId == cameraPointerId) {
+
+                              NativeInput.onOverlayJoystickEvent(
+                                  getCameraPlayerIndex(),
+                                  NativeAnalog.RStick,
+                                  0f,
+                                  0f
+                              )
+
+                              cameraPointerId = -1
+                              cameraLastX = 0f
+                              cameraLastY = 0f
+                              cameraLastTime = 0L
+
+                              return true
+                          }
+                      }
+                  }
+
+                  return false
+              }
+
+          """
+
+          overlay_src = replace_once(
+              overlay_src,
+              "    private fun playHaptics(event: MotionEvent) {",
+              camera_helpers +
+              "    private fun playHaptics(event: MotionEvent) {",
+              "insert camera helper functions",
+          )
+
+          # Camera gets the touch only AFTER normal overlay controls.
+          overlay_src = replace_once(
+              overlay_src,
+              """        if (shouldUpdateView) {
+              invalidate()
+          }
+
+          if (!BooleanSetting.TOUCHSCREEN.getBoolean()) {""",
+              """        if (shouldUpdateView) {
+              invalidate()
+          }
+
+          if (updateRightTouchCamera(event)) {
+              return true
+          }
+
+          if (!BooleanSetting.TOUCHSCREEN.getBoolean()) {""",
+              "intercept right touch camera",
+          )
+
+          # Remove the visible R-Stick.
+          old_rstick = """                OverlayControl.STICK_R.id -> {
+                    overlayJoysticks.add(
+                        initializeOverlayJoystick(
+                            context,
+                            windowSize,
+                            R.drawable.joystick_range,
+                            R.drawable.joystick,
+                            R.drawable.joystick_depressed,
+                            NativeAnalog.RStick,
+                            NativeButton.RStick,
+                            data,
+                            position
+                        )
+                    )
+                }"""
+
+          new_rstick = """                OverlayControl.STICK_R.id -> {
+                    // R-Stick is controlled by Right Touch Camera.
+                    // No visible R-Stick is created.
+                }"""
+
+          overlay_src = replace_once(
+              overlay_src,
+              old_rstick,
+              new_rstick,
+              "replace visual R-Stick",
+          )
+
+          overlay_file.write_text(overlay_src)
+
+          print("========================================")
+          print("PATCH OK")
+          print("========================================")
+          print("Pause/Resume:", activity_file)
+          print("L Toggle:", button_file)
+          print("Right Touch Camera:", overlay_file)
+
+          PY
+
+      # ============================================================
+      # VERIFY PATCHES
+      # ============================================================
+
+      - name: Verify patches
+        run: |
+          echo "========================================"
+          echo "PAUSE / RESUME"
+          echo "========================================"
+
+          grep -n \
+            "fabPauseResume\|setupPauseResumeButton\|NativeLibrary.isPaused" \
+            eden/src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt
+
+          echo ""
+          echo "========================================"
+          echo "L TOGGLE"
+          echo "========================================"
+
+          grep -n \
+            "button == NativeButton.L\|L is a toggle" \
+            eden/src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlayDrawableButton.kt
+
+          echo ""
+          echo "========================================"
+          echo "RIGHT TOUCH CAMERA"
+          echo "========================================"
+
+          grep -n \
+            "cameraPointerId\|updateRightTouchCamera\|isRightTouchCameraArea\|Right Touch Camera" \
+            eden/src/android/app/src/main/java/org/yuzu/yuzu_emu/overlay/InputOverlay.kt
+
+          echo ""
+          echo "========================================"
+          echo "GIT DIFF CHECK"
+          echo "========================================"
+
+          cd eden
+
+          git diff --check
+
+          git diff --stat
+
+      # ============================================================
+      # JAVA
+      # ============================================================
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ============================================================
+      # ANDROID SDK
+      # ============================================================
+
+      - name: Install Android SDK components
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;26.1.10909125" \
+            "cmake;3.22.1"
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      # ============================================================
+      # GLSLANG
+      # ============================================================
+
+      - name: Install glslangValidator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+
+          which glslangValidator
+          glslangValidator --version
+
+      # ============================================================
+      # GRADLE
+      # ============================================================
+
+      - name: Gradle settings
+        run: |
+          mkdir -p "$HOME/.gradle"
+
+          printf '%s\n' \
+            'org.gradle.jvmargs=-Xmx8g -XX:+UseParallelGC' \
+            'org.gradle.daemon=false' \
+            'org.gradle.caching=true' \
+            > "$HOME/.gradle/gradle.properties"
+
+      # ============================================================
+      # BUILD
+      # ============================================================
+
+      - name: Build optimized APK
+        working-directory: eden/src/android
+        run: |
+          FLAVOR_CAP="$(echo '${{ inputs.flavor }}' | sed 's/^\(.\)/\U\1/')"
+
+          NIGHTLY_FLG=""
+
+          if [ "${{ inputs.nightly }}" = "true" ]; then
+            NIGHTLY_FLG="-Pnightly=true"
+          fi
+
+          chmod +x gradlew
+
+          ./gradlew \
+            --console=plain \
+            --stacktrace \
+            ":app:assemble${FLAVOR_CAP}Release" \
+            ${NIGHTLY_FLG} || {
+
+              echo "========================================"
+              echo "BUILD FAILED"
+              echo "========================================"
+
+              find . \
+                -name "*.log" \
+                -o -name "*error*.txt" \
+                | xargs -r cat
+
+              exit 1
+          }
+
+      # ============================================================
+      # FIND APK
+      # ============================================================
+
+      - name: Locate APK
+        id: apk
+        run: |
+          APK="$(find eden/src/android/app/build/outputs/apk \
+            -name '*.apk' | head -n1)"
+
+          if [ -z "$APK" ]; then
+            echo "APK NOT FOUND"
+            exit 1
+          fi
+
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+
+          ls -lh "$APK"
+
+      # ============================================================
+      # UPLOAD APK
+      # ============================================================
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-${{ inputs.flavor }}-pause-l-toggle-camera
+          path: ${{ steps.apk.outputs.apk }}
+          if-no-files-found: error
+          retention-days: 30
